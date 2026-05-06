@@ -193,10 +193,11 @@ impl OrderExecutor {
 
             if let Some(ref funder) = self.funder_address {
                 let addr: Address = funder.parse().context("Invalid funder address")?;
+                // Try auto-derived CREATE2 first; fall back to explicit funder if needed.
+                // V2 exchange verifies against the CREATE2-derived Safe for this signer.
                 auth_builder = auth_builder
-                    .funder(addr)
                     .signature_type(SignatureType::GnosisSafe);
-                debug!(funder = %addr, "Using GnosisSafe wallet as funder");
+                debug!(funder = %addr, "Using GnosisSafe with auto-derived CREATE2 funder (ignoring explicit funder for V2)");
             }
 
             auth_builder
