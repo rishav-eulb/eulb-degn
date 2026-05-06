@@ -232,6 +232,13 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                     info!(fill_price, asset = asset_key.as_str(), "Leg2 filled — position LOCKED");
                                     state.leg_manager.on_leg2_fill(fill_price);
                                 }
+                                Ok(OrderResult::Live { limit_price, shares, order_id }) => {
+                                    info!(
+                                        limit_price, shares, order_id,
+                                        asset = asset_key.as_str(),
+                                        "Leg2 limit order LIVE on book — awaiting fill"
+                                    );
+                                }
                                 Ok(OrderResult::Rejected { reason }) => {
                                     warn!(reason, asset = asset_key.as_str(), "Leg2 rejected");
                                     let action = state.leg_manager.on_leg2_rejected();

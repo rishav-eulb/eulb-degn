@@ -24,6 +24,8 @@ type AuthenticatedClient =
 pub enum OrderResult {
     Filled { fill_price: f64, shares: f64 },
     PartialFill { fill_price: f64, filled_shares: f64, remaining_shares: f64 },
+    /// Limit order accepted and resting on the book (not yet matched).
+    Live { limit_price: f64, shares: f64, order_id: String },
     Rejected { reason: String },
 }
 
@@ -311,7 +313,7 @@ impl OrderExecutor {
             "Market order response"
         );
 
-        Self::to_order_result(response, amount)
+        Self::to_order_result(response, amount, None)
     }
 
     async fn execute_limit_order(
@@ -381,12 +383,13 @@ impl OrderExecutor {
             "Limit order response"
         );
 
-        Self::to_order_result(response, size)
+        Self::to_order_result(response, size, Some(price))
     }
 
     fn to_order_result(
         response: polymarket_client_sdk_v2::clob::types::response::PostOrderResponse,
         requested_amount: rust_decimal::Decimal,
+        limit_price: Option<rust_decimal::Decimal>,
     ) -> Result<OrderResult> {
         if !response.success {
             let reason = response.error_msg.unwrap_or_else(|| format!("{:?}", response.status));
@@ -402,15 +405,12 @@ impl OrderExecutor {
                 info!(fill_price, shares = taking, "Order MATCHED");
                 Ok(OrderResult::Filled { fill_price, shares: taking })
             }
-            OrderStatusType::Delayed => {
+            OrderStatusType::Delayed | OrderStatusType::Live => {
                 let shares = requested_amount.to_f64().unwrap_or(0.0);
-                info!(shares, "Order DELAYED (accepted, pending match)");
-                Ok(OrderResult::Filled { fill_price: 0.0, shares })
-            }
-            OrderStatusType::Live => {
-                let shares = requested_amount.to_f64().unwrap_or(0.0);
-                info!(shares, order_id = %response.order_id, "Order LIVE on book");
-                Ok(OrderResult::Filled { fill_price: 0.0, shares })
+                let lp = limit_price.and_then(|p| p.to_f64()).unwrap_or(0.0);
+                let oid = response.order_id.to_string();
+                info!(shares, limit_price = lp, order_id = %oid, "Order LIVE/DELAYED on book");
+                Ok(OrderResult::Live { limit_price: lp, shares, order_id: oid })
             }
             OrderStatusType::Canceled | OrderStatusType::Unmatched => {
                 let reason = format!("Order status: {:?}", response.status);
