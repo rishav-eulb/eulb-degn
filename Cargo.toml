@@ -1,0 +1,62 @@
+[package]
+name = "polymarket-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Polymarket SDK
+polymarket_client_sdk_v2 = { version = "0.5", features = ["clob", "ws", "rtds", "gamma", "ctf"] }
+
+# Chainlink price feeds
+chainlink-data-streams-sdk = { version = "1.2", features = ["full"] }
+chainlink-data-streams-report = "1.2"
+
+# Hyperliquid (implemented directly over WebSocket — no SDK to avoid alloy version conflicts)
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Decimal math
+rust_decimal = "1"
+rust_decimal_macros = "1"
+
+# Crypto/signing (re-exported by polymarket SDK, listed for IDE clarity)
+# alloy is re-exported via polymarket_client_sdk_v2::auth
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+dotenvy = "0.15"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto (for PrivateKeySigner type alias)
+k256 = "0.13"
+
+# Alloy (EVM toolkit — needed for setup_wallet example and direct contract calls)
+alloy = { version = "1.6", features = ["contract", "providers", "signer-local", "signers", "sol-types", "reqwest", "reqwest-rustls-tls"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

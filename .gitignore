@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target/
+
+# Environment files
+.env
+
+# Logs and runtime state
+/logs/
+
+# OS files
+.DS_Store
