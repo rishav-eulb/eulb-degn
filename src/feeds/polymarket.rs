@@ -80,18 +80,30 @@ static MSG_LOG_CTR: AtomicU64 = AtomicU64::new(0);
 const MSG_LOG_LIMIT: u64 = 20;
 
 /// Runs the Polymarket CLOB WebSocket for orderbook data.
-/// Subscribes to orderbook updates for the given token IDs.
-/// Accepts a `sub_rx` channel for incremental subscription of new token IDs
-/// without tearing down the connection.
+/// Waits for the first token IDs from `sub_rx` before connecting. When new
+/// token IDs arrive, reconnects with the full accumulated set (the CLOB WS
+/// only supports a single subscription message per connection).
 /// Sends PING every 10s to keep the connection alive.
 pub async fn run_poly_clob_ws(
     ws_url: &str,
-    token_ids: Vec<String>,
     tx: mpsc::UnboundedSender<PolyEvent>,
     mut sub_rx: mpsc::UnboundedReceiver<Vec<String>>,
 ) -> Result<()> {
+    let mut all_token_ids: Vec<String> = Vec::new();
+
+    info!("Poly WS: waiting for first token IDs before connecting...");
+    if let Some(first_batch) = sub_rx.recv().await {
+        all_token_ids.extend(first_batch);
+    } else {
+        warn!("Poly WS: subscription channel closed before any tokens received");
+        return Ok(());
+    }
+
     loop {
-        info!("Connecting to Polymarket CLOB WebSocket...");
+        info!(
+            token_count = all_token_ids.len(),
+            "Connecting to Polymarket CLOB WebSocket..."
+        );
 
         match connect_async(ws_url).await {
             Ok((ws_stream, _)) => {
@@ -99,7 +111,7 @@ pub async fn run_poly_clob_ws(
                 let (mut write, mut read) = ws_stream.split();
 
                 let sub_msg = serde_json::json!({
-                    "assets_ids": &token_ids,
+                    "assets_ids": &all_token_ids,
                     "type": "market",
                     "custom_feature_enabled": true
                 });
@@ -125,16 +137,12 @@ pub async fn run_poly_clob_ws(
                             if new_ids.is_empty() {
                                 continue;
                             }
-                            info!(count = new_ids.len(), "Adding incremental Poly WS subscriptions");
-                            let sub_msg = serde_json::json!({
-                                "assets_ids": &new_ids,
-                                "type": "market",
-                                "custom_feature_enabled": true
-                            });
-                            if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
-                                warn!(error = %e, "Failed to send incremental subscription");
-                                break;
-                            }
+                            info!(
+                                new = new_ids.len(),
+                                "New Poly tokens discovered, reconnecting WS with full set"
+                            );
+                            all_token_ids.extend(new_ids);
+                            break; // reconnect with full accumulated set
                         }
                         msg_opt = read.next() => {
                             match msg_opt {
@@ -179,8 +187,8 @@ pub async fn run_poly_clob_ws(
             }
         }
 
-        warn!("Polymarket CLOB WS disconnected, reconnecting in 3s...");
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        warn!("Polymarket CLOB WS disconnected, reconnecting in 1s...");
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

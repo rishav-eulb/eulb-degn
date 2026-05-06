@@ -191,7 +191,7 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
     let poly_tx_clone = poly_tx.clone();
     let ws_url_clone = poly_ws_url.clone();
     tokio::spawn(async move {
-        let _ = feeds::run_poly_clob_ws(&ws_url_clone, vec![], poly_tx_clone, poly_sub_rx).await;
+        let _ = feeds::run_poly_clob_ws(&ws_url_clone, poly_tx_clone, poly_sub_rx).await;
     });
 
     loop {
@@ -245,16 +245,7 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    error!(error = %e, asset = asset_key.as_str(), "Leg2 order error");
-                                    let action = state.leg_manager.on_leg2_rejected();
-                                    if let LegAction::PlaceLeg2 { token_id, price, shares } = &action {
-                                        let _ = order_tx.send(OrderRequest::Leg2Limit {
-                                            token_id: token_id.clone(),
-                                            price: *price,
-                                            shares: *shares,
-                                            asset_key: asset_key.clone(),
-                                        });
-                                    }
+                                    error!(error = %e, asset = asset_key.as_str(), "Leg2 order error (not retrying — likely a build/signing failure)");
                                 }
                                 _ => {}
                             }

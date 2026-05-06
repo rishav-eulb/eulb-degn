@@ -152,14 +152,22 @@ impl OrderExecutor {
     }
 
     async fn execute_leg2(&self, token_id: &str, price: f64, shares: f64) -> Result<OrderResult> {
-        info!(token_id, price, shares, "Placing Leg2 limit order (maker)");
+        // Polymarket CLOB requires prices on a 0.01 tick grid; floor to stay within budget.
+        let price_ticked = (price * 100.0).floor() / 100.0;
+        if price_ticked <= 0.0 || price_ticked >= 1.0 {
+            anyhow::bail!(
+                "Leg2 price {price} rounds to {price_ticked} which is outside (0, 1)"
+            );
+        }
+
+        info!(token_id, price = price_ticked, shares, "Placing Leg2 limit order (maker)");
 
         if self.inner.dry_run {
             debug!("DRY RUN — simulating Leg2 fill");
-            return Ok(OrderResult::Filled { fill_price: price, shares });
+            return Ok(OrderResult::Filled { fill_price: price_ticked, shares });
         }
 
-        let price_dec = rust_decimal::Decimal::from_f64(price).context("Invalid Leg2 price")?;
+        let price_dec = rust_decimal::Decimal::from_f64(price_ticked).context("Invalid Leg2 price")?;
         let size_dec = rust_decimal::Decimal::from_f64(shares).context("Invalid Leg2 shares")?;
         self.execute_limit_order(token_id, Side::Buy, price_dec, size_dec).await
     }
