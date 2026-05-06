@@ -1,24 +1,24 @@
+use std::str::FromStr;
+
+use alloy::primitives::B256;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::Signer as _;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use polymarket_client_sdk_v2::ctf::types::RedeemPositionsRequest;
+use polymarket_client_sdk_v2::types::address;
+use polymarket_client_sdk_v2::POLYGON;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// CTF contract on Polygon for standard (non-negative-risk) markets.
-const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
-
-/// NegRisk Adapter for negative-risk markets (BTC/ETH up/down markets use this).
-const NEG_RISK_ADAPTER: &str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
+type PrivateKeySigner =
+    polymarket_client_sdk_v2::auth::LocalSigner<k256::ecdsa::SigningKey>;
 
 /// pUSD (USDC.e) collateral token on Polygon used by Polymarket.
-const COLLATERAL_TOKEN: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-
-/// Zero bytes32 for parentCollectionId.
-const PARENT_COLLECTION_ID: &str =
-    "0x0000000000000000000000000000000000000000000000000000000000000000";
+const COLLATERAL_TOKEN: alloy::primitives::Address =
+    address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 /// Delay after market end before attempting redemption (seconds).
 const REDEEM_DELAY_SECS: u64 = 120;
@@ -33,24 +33,6 @@ pub struct PendingRedemption {
     pub attempts: u32,
 }
 
-/// Manages auto-redemption of winning tokens after market resolution.
-pub struct Redeemer {
-    pending: VecDeque<PendingRedemption>,
-    http_client: Client,
-    clob_url: String,
-    private_key: String,
-    dry_run: bool,
-}
-
-/// Response from the Polymarket CLOB /redeem endpoint.
-#[derive(Debug, Deserialize)]
-struct RedeemResponse {
-    success: Option<bool>,
-    #[serde(rename = "transactionHash")]
-    transaction_hash: Option<String>,
-    error: Option<String>,
-}
-
 /// Command sent to the background redeemer task.
 #[derive(Debug)]
 pub enum RedeemCommand {
@@ -61,31 +43,33 @@ pub enum RedeemCommand {
     },
 }
 
-/// Request body for the Polymarket Builder Relayer redeem endpoint.
-#[derive(Debug, Serialize)]
-struct RedeemRequest {
-    condition_id: String,
+/// Manages auto-redemption of winning tokens after market resolution,
+/// using on-chain CTF contract calls via the Polymarket SDK.
+pub struct Redeemer {
+    pending: VecDeque<PendingRedemption>,
+    rpc_url: String,
+    private_key: String,
+    dry_run: bool,
 }
 
 impl Redeemer {
-    pub fn new(clob_url: String, private_key: String, dry_run: bool) -> Self {
+    pub fn new(rpc_url: String, private_key: String, dry_run: bool) -> Self {
         Self {
             pending: VecDeque::new(),
-            http_client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client"),
-            clob_url,
+            rpc_url,
             private_key,
             dry_run,
         }
     }
 
-    /// Schedule a market for redemption after the standard delay.
-    pub fn schedule_redemption(&mut self, condition_id: String, slug: String, market_end_ts: DateTime<Utc>) {
+    pub fn schedule_redemption(
+        &mut self,
+        condition_id: String,
+        slug: String,
+        market_end_ts: DateTime<Utc>,
+    ) {
         let redeem_after = market_end_ts + chrono::Duration::seconds(REDEEM_DELAY_SECS as i64);
 
-        // Don't add duplicates
         if self.pending.iter().any(|p| p.condition_id == condition_id) {
             debug!(slug, "Redemption already scheduled");
             return;
@@ -107,8 +91,6 @@ impl Redeemer {
         });
     }
 
-    /// Check if any pending redemptions are ready and execute them.
-    /// Returns the number of successful redemptions.
     pub async fn tick(&mut self) -> u32 {
         let now = Utc::now();
         let mut successes = 0u32;
@@ -125,12 +107,11 @@ impl Redeemer {
                     info!(
                         slug = pending.slug.as_str(),
                         condition_id = pending.condition_id.as_str(),
-                        "Redemption successful — USDC collected"
+                        "Redemption successful — collateral collected"
                     );
                     successes += 1;
                 }
                 Ok(false) => {
-                    // Market not yet resolved — retry later
                     pending.attempts += 1;
                     if pending.attempts < 10 {
                         pending.redeem_after = now + chrono::Duration::seconds(30);
@@ -154,14 +135,14 @@ impl Redeemer {
                         warn!(
                             slug = pending.slug.as_str(),
                             attempt = pending.attempts,
-                            error = %e,
+                            error = ?e,
                             "Redemption failed, will retry"
                         );
                         retry_later.push_back(pending);
                     } else {
                         error!(
                             slug = pending.slug.as_str(),
-                            error = %e,
+                            error = ?e,
                             "Giving up on redemption after 10 attempts"
                         );
                     }
@@ -173,13 +154,10 @@ impl Redeemer {
         successes
     }
 
-    /// Number of pending redemptions.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    /// Move the redeemer into its own background task so it never blocks the main loop.
-    /// Returns a sender for scheduling new redemptions.
     pub fn spawn(mut self) -> mpsc::UnboundedSender<RedeemCommand> {
         let (tx, mut rx) = mpsc::unbounded_channel::<RedeemCommand>();
         tokio::spawn(async move {
@@ -206,7 +184,6 @@ impl Redeemer {
         tx
     }
 
-    /// Execute the actual redemption call.
     async fn execute_redeem(&self, pending: &PendingRedemption) -> Result<bool> {
         if self.dry_run {
             info!(
@@ -217,75 +194,58 @@ impl Redeemer {
             return Ok(true);
         }
 
-        // Use the Polymarket CLOB API's /redeem endpoint (Builder Relayer pattern).
-        // This is simpler than raw contract calls — the relayer handles the on-chain tx.
-        let url = format!("{}/redeem", self.clob_url);
+        let condition_id = B256::from_str(&pending.condition_id)
+            .context("Invalid condition_id hex")?;
 
-        let resp = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("POLY_ADDRESS", derive_poly_address(&self.private_key))
-            .header("POLY_SIGNATURE", self.sign_redeem_request(&pending.condition_id))
-            .json(&RedeemRequest {
-                condition_id: pending.condition_id.clone(),
-            })
-            .send()
+        let signer: PrivateKeySigner = PrivateKeySigner::from_str(&self.private_key)
+            .context("Invalid private key for redeemer")?
+            .with_chain_id(Some(POLYGON));
+
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect(&self.rpc_url)
             .await
-            .context("Redeem HTTP request failed")?;
+            .context("Failed to connect to Polygon RPC")?;
 
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let ctf_client =
+            polymarket_client_sdk_v2::ctf::Client::with_neg_risk(provider, POLYGON)
+                .context("Failed to create CTF client")?;
 
-        if status.is_success() {
-            if let Ok(parsed) = serde_json::from_str::<RedeemResponse>(&body) {
-                if parsed.success.unwrap_or(false) {
-                    info!(
-                        slug = pending.slug.as_str(),
-                        tx_hash = parsed.transaction_hash.as_deref().unwrap_or("unknown"),
-                        "Redeem tx submitted"
-                    );
-                    return Ok(true);
-                }
-                if let Some(err) = parsed.error {
-                    if err.contains("not resolved") || err.contains("not yet") {
-                        return Ok(false);
-                    }
-                    anyhow::bail!("Redeem API error: {}", err);
-                }
+        let request = RedeemPositionsRequest::for_binary_market(
+            COLLATERAL_TOKEN,
+            condition_id,
+        );
+
+        info!(
+            slug = pending.slug.as_str(),
+            condition_id = pending.condition_id.as_str(),
+            "Submitting on-chain redeem tx (standard CTF)"
+        );
+
+        match ctf_client.redeem_positions(&request).await {
+            Ok(resp) => {
+                info!(
+                    slug = pending.slug.as_str(),
+                    tx_hash = %resp.transaction_hash,
+                    block = resp.block_number,
+                    "Redeem tx confirmed"
+                );
+                Ok(true)
             }
-            Ok(true)
-        } else if status.as_u16() == 400 || status.as_u16() == 422 {
-            // Possibly not yet resolved
-            if body.contains("not resolved") || body.contains("not yet") {
-                Ok(false)
-            } else {
-                anyhow::bail!("Redeem API {} — {}", status, body);
+            Err(e) => {
+                let err_str = format!("{e:?}");
+                if err_str.contains("not resolved")
+                    || err_str.contains("payout denominator is not set")
+                {
+                    return Ok(false);
+                }
+                warn!(
+                    slug = pending.slug.as_str(),
+                    error = ?e,
+                    "Standard CTF redeem failed"
+                );
+                Err(anyhow::anyhow!("{e}"))
             }
-        } else {
-            anyhow::bail!("Redeem API {} — {}", status, body);
         }
-    }
-
-    /// Sign the redemption request. In production, this uses L1 auth headers.
-    /// For now, returns a placeholder — actual signing uses polymarket_client_sdk_v2.
-    fn sign_redeem_request(&self, _condition_id: &str) -> String {
-        // TODO: Implement proper EIP-712 signing with the private key
-        // using polymarket_client_sdk_v2::auth module
-        "placeholder_signature".to_string()
-    }
-}
-
-/// Derive the Polygon address from a private key.
-/// In production, use alloy/ethers to derive the actual address.
-fn derive_poly_address(private_key: &str) -> String {
-    // TODO: Implement proper address derivation
-    // For now return a placeholder — the actual implementation uses:
-    // let wallet = LocalWallet::from_str(private_key)?;
-    // format!("{:?}", wallet.address())
-    if private_key.starts_with("0x") && private_key.len() > 10 {
-        format!("0x{}", &private_key[2..42])
-    } else {
-        "0x0000000000000000000000000000000000000000".to_string()
     }
 }

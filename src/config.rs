@@ -40,6 +40,9 @@ pub struct Config {
     pub cooldown_after_losses: u32,
     pub cooldown_duration_secs: u64,
 
+    // Polygon RPC
+    pub polygon_rpc_url: String,
+
     // General
     pub log_level: String,
     pub dry_run: bool,
@@ -106,6 +109,12 @@ impl Config {
             max_daily_loss_usd: parse_f64("MAX_DAILY_LOSS_USD", 200.0)?,
             cooldown_after_losses: parse_u64("COOLDOWN_AFTER_LOSSES", 3)? as u32,
             cooldown_duration_secs: parse_u64("COOLDOWN_DURATION_SECS", 300)?,
+
+            // Polygon RPC
+            polygon_rpc_url: optional(
+                "POLYGON_RPC_URL",
+                "https://polygon.llamarpc.com",
+            ),
 
             // General
             log_level: optional("LOG_LEVEL", "info"),

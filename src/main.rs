@@ -125,7 +125,7 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
     let (order_tx, mut order_rx) = executor.spawn();
 
     let redeemer = Redeemer::new(
-        cfg.polymarket_clob_url.clone(),
+        cfg.polygon_rpc_url.clone(),
         cfg.polymarket_private_key.clone(),
         cfg.dry_run,
     );
