@@ -9,9 +9,9 @@ pub struct StrategyParams {
     pub min_entry_price: f64,
     /// Maximum acceptable entry token price (e.g. 0.92).
     pub max_entry_price: f64,
-    /// Minimum seconds to wait after Leg1 fill before placing Leg2 limit.
+    /// Minimum seconds to wait after Leg1 fill before Leg2 scan.
     pub leg2_min_wait_secs: u64,
-    /// How long to keep Leg2 limit order alive before repricing (seconds).
+    /// Optimization window for Leg2 (track best price for N seconds).
     pub leg2_wait_secs: u64,
     /// Seconds before market expiry to force-close unlocked positions.
     pub force_close_secs: u64,
@@ -27,8 +27,6 @@ pub struct StrategyParams {
     pub taker_fee_rate: f64,
     /// Fee rate for maker orders (0%).
     pub maker_fee_rate: f64,
-    /// Minimum profit target per share for Leg2 (e.g. 0.01 = 1 cent/share).
-    pub min_profit_per_share: f64,
 }
 
 impl Default for StrategyParams {
@@ -47,7 +45,6 @@ impl Default for StrategyParams {
             slippage_cents: 0.01,
             taker_fee_rate: 0.02,
             maker_fee_rate: 0.0,
-            min_profit_per_share: 0.01,
         }
     }
 }
@@ -68,7 +65,6 @@ impl StrategyParams {
             slippage_cents: 0.01,
             taker_fee_rate: 0.02,
             maker_fee_rate: 0.0,
-            min_profit_per_share: 0.05,
         }
     }
 }

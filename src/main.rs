@@ -178,18 +178,6 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
     let mut redeem_ticker = tokio::time::interval(std::time::Duration::from_secs(15));
     redeem_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // --- Leg2 order monitoring ---
-    #[derive(Debug, Clone)]
-    struct PendingLeg2 {
-        order_id: String,
-        target_price: f64,
-        shares: f64,
-    }
-    let mut pending_leg2_orders: std::collections::HashMap<String, PendingLeg2> =
-        std::collections::HashMap::new();
-    let mut leg2_poll_ticker = tokio::time::interval(std::time::Duration::from_secs(3));
-    leg2_poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     // --- Main event loop ---
     info!("Entering main event loop");
 
@@ -209,15 +197,7 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                 Ok(OrderResult::Filled { fill_price, shares }) => {
                                     info!(fill_price, shares, asset = asset_key.as_str(), "Leg1 filled");
                                     risk_mgr.on_position_opened(&asset_key);
-                                    let leg2_action = state.leg_manager.on_leg1_fill(fill_price, shares);
-                                    if let LegAction::PlaceLeg2 { token_id, price, shares } = &leg2_action {
-                                        let _ = order_tx.send(OrderRequest::Leg2Limit {
-                                            token_id: token_id.clone(),
-                                            price: *price,
-                                            shares: *shares,
-                                            asset_key: asset_key.clone(),
-                                        });
-                                    }
+                                    state.leg_manager.on_leg1_fill(fill_price, shares);
                                 }
                                 Ok(OrderResult::Rejected { reason }) => {
                                     warn!(reason, asset = asset_key.as_str(), "Leg1 rejected");
@@ -233,30 +213,14 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                         OrderRequestKind::Leg2 => {
                             match result {
                                 Ok(OrderResult::Filled { fill_price, .. }) => {
-                                    pending_leg2_orders.remove(&asset_key);
                                     info!(fill_price, asset = asset_key.as_str(), "Leg2 filled — position LOCKED");
                                     state.leg_manager.on_leg2_fill(fill_price);
                                 }
-                                Ok(OrderResult::Live { order_id, target_price, shares }) => {
-                                    info!(
-                                        asset = asset_key.as_str(),
-                                        order_id = order_id.as_str(),
-                                        target_price,
-                                        "Leg2 resting on book — monitoring until filled"
-                                    );
-                                    pending_leg2_orders.insert(asset_key.clone(), PendingLeg2 {
-                                        order_id,
-                                        target_price,
-                                        shares,
-                                    });
-                                }
                                 Ok(OrderResult::Rejected { reason }) => {
-                                    pending_leg2_orders.remove(&asset_key);
                                     warn!(reason, asset = asset_key.as_str(), "Leg2 rejected");
                                     state.leg_manager.on_leg2_rejected();
                                 }
                                 Err(e) => {
-                                    pending_leg2_orders.remove(&asset_key);
                                     error!(error = %e, asset = asset_key.as_str(), "Leg2 order error");
                                     state.leg_manager.on_leg2_rejected();
                                 }
@@ -276,18 +240,6 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                             }
                         }
                     }
-                }
-            }
-
-            // Poll pending Leg2 orders to check if they've been filled
-            _ = leg2_poll_ticker.tick() => {
-                for (asset_key, pending) in pending_leg2_orders.clone().iter() {
-                    let _ = order_tx.send(OrderRequest::PollLeg2 {
-                        order_id: pending.order_id.clone(),
-                        asset_key: asset_key.clone(),
-                        target_price: pending.target_price,
-                        shares: pending.shares,
-                    });
                 }
             }
 

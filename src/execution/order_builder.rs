@@ -23,8 +23,6 @@ type AuthenticatedClient =
 #[derive(Debug, Clone)]
 pub enum OrderResult {
     Filled { fill_price: f64, shares: f64 },
-    /// Order is resting on the book, not yet matched.
-    Live { order_id: String, shares: f64, target_price: f64 },
     PartialFill { fill_price: f64, filled_shares: f64, remaining_shares: f64 },
     Rejected { reason: String },
 }
@@ -44,13 +42,6 @@ pub enum OrderRequest {
         price: f64,
         shares: f64,
         asset_key: String,
-    },
-    /// Poll a live Leg2 order to check if it has been filled.
-    PollLeg2 {
-        order_id: String,
-        asset_key: String,
-        target_price: f64,
-        shares: f64,
     },
     ForceClose {
         token_id: String,
@@ -112,10 +103,6 @@ impl OrderExecutor {
                         let result = self.execute_leg2(&token_id, price, shares).await;
                         let _ = result_tx.send((asset_key, OrderRequestKind::Leg2, result));
                     }
-                    OrderRequest::PollLeg2 { order_id, asset_key, target_price, shares } => {
-                        let result = self.poll_leg2_order(&order_id, target_price, shares).await;
-                        let _ = result_tx.send((asset_key, OrderRequestKind::Leg2, result));
-                    }
                     OrderRequest::ForceClose { token_id, shares, asset_key } => {
                         let result = self.execute_force_close(&token_id, shares).await;
                         let _ = result_tx.send((asset_key, OrderRequestKind::ForceClose, result));
@@ -152,9 +139,7 @@ impl OrderExecutor {
         }
 
         let price_dec = rust_decimal::Decimal::from_f64(price).context("Invalid Leg2 price")?;
-        let size_dec = rust_decimal::Decimal::from_f64(shares)
-            .context("Invalid Leg2 shares")?
-            .trunc_with_scale(2);
+        let size_dec = rust_decimal::Decimal::from_f64(shares).context("Invalid Leg2 shares")?;
         self.execute_limit_order(token_id, Side::Buy, price_dec, size_dec).await
     }
 
@@ -172,42 +157,6 @@ impl OrderExecutor {
         // Use aggressive minimum price hint to skip book fetch — force-close accepts any fill.
         let aggressive_price = Some(dec!(0.01));
         self.execute_market_order(token_id, Side::Sell, size_dec, aggressive_price).await
-    }
-
-    /// Poll a live Leg2 order to check if it's been filled.
-    async fn poll_leg2_order(&self, order_id: &str, target_price: f64, shares: f64) -> Result<OrderResult> {
-        let client = self.get_client().await?;
-        let order = client.order(order_id).await
-            .context("Failed to query Leg2 order status")?;
-
-        let matched = order.size_matched.to_f64().unwrap_or(0.0);
-        let original = order.original_size.to_f64().unwrap_or(0.0);
-
-        match order.status {
-            OrderStatusType::Matched => {
-                let fill_price = order.price.to_f64().unwrap_or(target_price);
-                info!(order_id, fill_price, matched, "Leg2 order FILLED");
-                Ok(OrderResult::Filled { fill_price, shares: matched })
-            }
-            OrderStatusType::Live => {
-                debug!(order_id, matched, original, "Leg2 still live on book");
-                Ok(OrderResult::Live {
-                    order_id: order_id.to_string(),
-                    shares,
-                    target_price,
-                })
-            }
-            _ => {
-                let reason = format!("Leg2 order gone: {:?} (matched {}/{})", order.status, matched, original);
-                warn!(order_id, reason = reason.as_str(), "Leg2 order no longer live");
-                if matched > 0.0 && matched >= original {
-                    let fill_price = order.price.to_f64().unwrap_or(target_price);
-                    Ok(OrderResult::Filled { fill_price, shares: matched })
-                } else {
-                    Ok(OrderResult::Rejected { reason })
-                }
-            }
-        }
     }
 
     /// Get or create the cached authenticated client.
@@ -336,7 +285,7 @@ impl OrderExecutor {
             "Market order response"
         );
 
-        Self::to_order_result(response, amount, hint_price)
+        Self::to_order_result(response, amount)
     }
 
     async fn execute_limit_order(
@@ -401,13 +350,12 @@ impl OrderExecutor {
             "Limit order response"
         );
 
-        Self::to_order_result(response, size, Some(price))
+        Self::to_order_result(response, size)
     }
 
     fn to_order_result(
         response: polymarket_client_sdk_v2::clob::types::response::PostOrderResponse,
         requested_amount: rust_decimal::Decimal,
-        limit_price: Option<rust_decimal::Decimal>,
     ) -> Result<OrderResult> {
         if !response.success {
             let reason = response.error_msg.unwrap_or_else(|| format!("{:?}", response.status));
@@ -423,22 +371,15 @@ impl OrderExecutor {
                 info!(fill_price, shares = taking, "Order MATCHED");
                 Ok(OrderResult::Filled { fill_price, shares: taking })
             }
-            OrderStatusType::Delayed | OrderStatusType::Live => {
+            OrderStatusType::Delayed => {
                 let shares = requested_amount.to_f64().unwrap_or(0.0);
-                let target_price = limit_price
-                    .and_then(|p| p.to_f64())
-                    .unwrap_or(0.0);
-                info!(
-                    shares,
-                    order_id = %response.order_id,
-                    status = ?response.status,
-                    "Order resting on book (not yet filled)"
-                );
-                Ok(OrderResult::Live {
-                    order_id: response.order_id.clone(),
-                    shares,
-                    target_price,
-                })
+                info!(shares, "Order DELAYED (accepted, pending match)");
+                Ok(OrderResult::Filled { fill_price: 0.0, shares })
+            }
+            OrderStatusType::Live => {
+                let shares = requested_amount.to_f64().unwrap_or(0.0);
+                info!(shares, order_id = %response.order_id, "Order LIVE on book");
+                Ok(OrderResult::Filled { fill_price: 0.0, shares })
             }
             OrderStatusType::Canceled | OrderStatusType::Unmatched => {
                 let reason = format!("Order status: {:?}", response.status);
