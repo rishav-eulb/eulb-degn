@@ -195,8 +195,8 @@ impl OrderExecutor {
                 let addr: Address = funder.parse().context("Invalid funder address")?;
                 auth_builder = auth_builder
                     .funder(addr)
-                    .signature_type(SignatureType::Poly1271);
-                debug!(funder = %addr, "Using Poly1271 (V2) smart contract wallet as funder");
+                    .signature_type(SignatureType::GnosisSafe);
+                debug!(funder = %addr, "Using GnosisSafe wallet as funder");
             }
 
             auth_builder

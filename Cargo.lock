@@ -2243,7 +2243,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -3063,9 +3063,9 @@ dependencies = [
 
 [[package]]
 name = "polymarket_client_sdk_v2"
-version = "0.5.1"
+version = "0.6.0-canary.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "594de0bf0e129e266946f02acbf579253951afbbee92fc1564da3c9179303aea"
+checksum = "60838f2225e2bf6578bc5f5e81fc7de5f855b611a6b4f0f3b65fa3c41f7d593f"
 dependencies = [
  "alloy",
  "async-stream",
@@ -3241,7 +3241,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3279,7 +3279,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5275,7 +5275,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
