@@ -1,7 +1,7 @@
 use crate::strategy::params::StrategyParams;
 use crate::strategy::signal::{EntrySignal, Leg1Side};
 use chrono::{DateTime, Utc};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// States of the two-leg state machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -13,16 +13,7 @@ pub enum LegState {
         signal: EntrySignal,
         order_time: DateTime<Utc>,
     },
-    /// Leg1 is filled, now scanning for a profitable Leg2 lock.
-    Scanning {
-        signal: EntrySignal,
-        leg1_fill_price: f64,
-        leg1_shares: f64,
-        fill_time: DateTime<Utc>,
-        first_profitable_time: Option<DateTime<Utc>>,
-        best_leg2_price: Option<f64>,
-    },
-    /// Leg2 order has been placed.
+    /// Leg2 order has been placed (immediately after Leg1 fill).
     Leg2Pending {
         signal: EntrySignal,
         leg1_fill_price: f64,
@@ -135,21 +126,43 @@ impl LegManager {
     }
 
     /// Called when Leg1 order is confirmed filled.
-    pub fn on_leg1_fill(&mut self, fill_price: f64, shares: f64) {
+    /// Immediately computes the max Leg2 price that guarantees a profitable lock
+    /// and returns a PlaceLeg2 action.
+    pub fn on_leg1_fill(&mut self, fill_price: f64, shares: f64) -> LegAction {
         if let LegState::Leg1Pending { signal, .. } = &self.state {
+            let max_leg2 = 1.0
+                - fill_price
+                - self.params.slippage_cents
+                - (fill_price * self.params.taker_fee_rate)
+                - self.params.min_profit_margin;
+
+            let opposite_token_id = match signal.leg1_side {
+                Leg1Side::Yes => self.no_token_id.clone(),
+                Leg1Side::No => self.yes_token_id.clone(),
+            };
+
             info!(
                 fill_price,
                 shares,
-                "Leg1 filled — starting Leg2 scan"
+                max_leg2_price = max_leg2,
+                "Leg1 filled — placing immediate Leg2 limit order"
             );
-            self.state = LegState::Scanning {
+
+            self.state = LegState::Leg2Pending {
                 signal: signal.clone(),
                 leg1_fill_price: fill_price,
                 leg1_shares: shares,
-                fill_time: Utc::now(),
-                first_profitable_time: None,
-                best_leg2_price: None,
+                leg2_target_price: max_leg2,
+                order_time: Utc::now(),
             };
+
+            LegAction::PlaceLeg2 {
+                token_id: opposite_token_id,
+                price: max_leg2,
+                shares,
+            }
+        } else {
+            LegAction::None
         }
     }
 
@@ -159,167 +172,35 @@ impl LegManager {
         self.state = LegState::Idle;
     }
 
-    /// Called every tick during Scanning state with the current opposite token ask.
-    /// Returns an action if Leg2 should be placed or force-close is needed.
-    pub fn on_tick(&mut self, opposite_ask: f64, now: DateTime<Utc>) -> LegAction {
+    /// Called every tick with the current opposite token ask price.
+    /// Now only handles force-close during Leg2Pending (no more Scanning state).
+    pub fn on_tick(&mut self, _opposite_ask: f64, now: DateTime<Utc>) -> LegAction {
         let secs_to_expiry = self.secs_to_expiry(now);
 
-        match &self.state {
-            LegState::Scanning {
-                signal,
-                leg1_fill_price,
-                leg1_shares,
-                fill_time,
-                first_profitable_time,
-                best_leg2_price,
-            } => {
-                let secs_since_fill = (now - *fill_time).num_seconds() as u64;
-
-                // Force close if approaching expiry
-                if secs_to_expiry <= self.params.force_close_secs {
-                    let token_id = match signal.leg1_side {
-                        Leg1Side::Yes => self.yes_token_id.clone(),
-                        Leg1Side::No => self.no_token_id.clone(),
-                    };
-                    let shares = *leg1_shares;
-                    self.state = LegState::ForceClose {
-                        signal: signal.clone(),
-                        leg1_fill_price: *leg1_fill_price,
-                        shares,
-                    };
-                    warn!(secs_to_expiry, "Force-closing Leg1 — market expiring");
-                    return LegAction::ForceCloseLeg1 { token_id, shares };
-                }
-
-                // Wait minimum time before scanning
-                if secs_since_fill < self.params.leg2_min_wait_secs {
-                    return LegAction::None;
-                }
-
-                // Check if lock is profitable
-                let leg1_cost = *leg1_fill_price + self.params.slippage_cents;
-                let leg2_cost = opposite_ask + self.params.slippage_cents;
-                let combined = leg1_cost + leg2_cost;
-                let fee = leg1_cost * self.params.taker_fee_rate
-                    + leg2_cost * self.params.maker_fee_rate;
-                let total_cost = combined + fee;
-                let profit = 1.0 - total_cost;
-
-                if profit > 0.0 {
-                    // Profitable lock available
-                    let new_first_profitable = first_profitable_time.or(Some(now));
-                    let current_best = best_leg2_price
-                        .map(|b| b.min(opposite_ask))
-                        .unwrap_or(opposite_ask);
-
-                    let secs_since_first_profitable = new_first_profitable
-                        .map(|t| (now - t).num_seconds() as u64)
-                        .unwrap_or(0);
-
-                    // If we've waited the optimization window, place Leg2
-                    if secs_since_first_profitable >= self.params.leg2_wait_secs {
-                        let target_price = current_best;
-                        let opposite_token_id = match signal.leg1_side {
-                            Leg1Side::Yes => self.no_token_id.clone(),
-                            Leg1Side::No => self.yes_token_id.clone(),
-                        };
-                        let shares = *leg1_shares;
-
-                        info!(
-                            target_price,
-                            profit = 1.0 - (leg1_cost + target_price + self.params.slippage_cents + fee),
-                            "Leg2 optimization window complete — placing order"
-                        );
-
-                        self.state = LegState::Leg2Pending {
-                            signal: signal.clone(),
-                            leg1_fill_price: *leg1_fill_price,
-                            leg1_shares: shares,
-                            leg2_target_price: target_price,
-                            order_time: now,
-                        };
-
-                        // Use limit (maker) if enough time, otherwise FOK
-                        let use_maker = secs_to_expiry > 20;
-                        let _ = use_maker; // TODO: differentiate order type
-
-                        return LegAction::PlaceLeg2 {
-                            token_id: opposite_token_id,
-                            price: target_price,
-                            shares,
-                        };
-                    }
-
-                    // Update tracking state
-                    self.state = LegState::Scanning {
-                        signal: signal.clone(),
-                        leg1_fill_price: *leg1_fill_price,
-                        leg1_shares: *leg1_shares,
-                        fill_time: *fill_time,
-                        first_profitable_time: new_first_profitable,
-                        best_leg2_price: Some(current_best),
-                    };
-                } else if first_profitable_time.is_some() && best_leg2_price.is_some() {
-                    // Had a profitable window but price moved away — take best seen
-                    let target_price = best_leg2_price.unwrap();
-                    let opposite_token_id = match signal.leg1_side {
-                        Leg1Side::Yes => self.no_token_id.clone(),
-                        Leg1Side::No => self.yes_token_id.clone(),
-                    };
-                    let shares = *leg1_shares;
-
-                    debug!(
-                        target_price,
-                        "Profitable window closed — locking at best seen price"
-                    );
-
-                    self.state = LegState::Leg2Pending {
-                        signal: signal.clone(),
-                        leg1_fill_price: *leg1_fill_price,
-                        leg1_shares: shares,
-                        leg2_target_price: target_price,
-                        order_time: now,
-                    };
-
-                    return LegAction::PlaceLeg2 {
-                        token_id: opposite_token_id,
-                        price: target_price,
-                        shares,
-                    };
-                }
-
-                LegAction::None
+        if let LegState::Leg2Pending {
+            signal,
+            leg1_fill_price,
+            leg1_shares,
+            ..
+        } = &self.state
+        {
+            if secs_to_expiry <= self.params.force_close_secs {
+                let token_id = match signal.leg1_side {
+                    Leg1Side::Yes => self.yes_token_id.clone(),
+                    Leg1Side::No => self.no_token_id.clone(),
+                };
+                let shares = *leg1_shares;
+                self.state = LegState::ForceClose {
+                    signal: signal.clone(),
+                    leg1_fill_price: *leg1_fill_price,
+                    shares,
+                };
+                warn!(secs_to_expiry, "Leg2 unfilled near expiry — force-closing");
+                return LegAction::ForceCloseLeg1 { token_id, shares };
             }
-
-            LegState::Leg2Pending { .. } => {
-                // Force close if approaching expiry and Leg2 hasn't filled
-                if secs_to_expiry <= self.params.force_close_secs {
-                    if let LegState::Leg2Pending {
-                        signal,
-                        leg1_fill_price,
-                        leg1_shares,
-                        ..
-                    } = &self.state
-                    {
-                        let token_id = match signal.leg1_side {
-                            Leg1Side::Yes => self.yes_token_id.clone(),
-                            Leg1Side::No => self.no_token_id.clone(),
-                        };
-                        let shares = *leg1_shares;
-                        self.state = LegState::ForceClose {
-                            signal: signal.clone(),
-                            leg1_fill_price: *leg1_fill_price,
-                            shares,
-                        };
-                        warn!("Leg2 unfilled near expiry — force-closing");
-                        return LegAction::ForceCloseLeg1 { token_id, shares };
-                    }
-                }
-                LegAction::None
-            }
-
-            _ => LegAction::None,
         }
+
+        LegAction::None
     }
 
     /// Called when Leg2 order is filled.
@@ -356,24 +237,40 @@ impl LegManager {
         }
     }
 
-    /// Called when Leg2 order is not filled (retry logic).
-    pub fn on_leg2_rejected(&mut self) {
+    /// Called when Leg2 order is rejected. Re-places the limit order at the same price.
+    pub fn on_leg2_rejected(&mut self) -> LegAction {
         if let LegState::Leg2Pending {
             signal,
             leg1_fill_price,
             leg1_shares,
+            leg2_target_price,
             ..
         } = &self.state
         {
-            debug!("Leg2 not filled — returning to Scanning");
-            self.state = LegState::Scanning {
+            let opposite_token_id = match signal.leg1_side {
+                Leg1Side::Yes => self.no_token_id.clone(),
+                Leg1Side::No => self.yes_token_id.clone(),
+            };
+            let price = *leg2_target_price;
+            let shares = *leg1_shares;
+
+            warn!(price, "Leg2 rejected — re-placing limit order");
+
+            self.state = LegState::Leg2Pending {
                 signal: signal.clone(),
                 leg1_fill_price: *leg1_fill_price,
-                leg1_shares: *leg1_shares,
-                fill_time: Utc::now(),
-                first_profitable_time: None,
-                best_leg2_price: None,
+                leg1_shares: shares,
+                leg2_target_price: price,
+                order_time: Utc::now(),
             };
+
+            LegAction::PlaceLeg2 {
+                token_id: opposite_token_id,
+                price,
+                shares,
+            }
+        } else {
+            LegAction::None
         }
     }
 
@@ -401,7 +298,6 @@ impl LegManager {
     pub fn current_direction(&self) -> Option<&crate::strategy::signal::Direction> {
         match &self.state {
             LegState::Leg1Pending { signal, .. }
-            | LegState::Scanning { signal, .. }
             | LegState::Leg2Pending { signal, .. }
             | LegState::Locked { signal, .. }
             | LegState::ForceClose { signal, .. } => Some(&signal.direction),
@@ -412,7 +308,6 @@ impl LegManager {
     pub fn current_leg1_side(&self) -> Option<&Leg1Side> {
         match &self.state {
             LegState::Leg1Pending { signal, .. }
-            | LegState::Scanning { signal, .. }
             | LegState::Leg2Pending { signal, .. }
             | LegState::Locked { signal, .. }
             | LegState::ForceClose { signal, .. } => Some(&signal.leg1_side),
@@ -422,8 +317,7 @@ impl LegManager {
 
     pub fn leg1_fill_price(&self) -> Option<f64> {
         match &self.state {
-            LegState::Scanning { leg1_fill_price, .. }
-            | LegState::Leg2Pending { leg1_fill_price, .. }
+            LegState::Leg2Pending { leg1_fill_price, .. }
             | LegState::Locked { leg1_fill_price, .. }
             | LegState::ForceClose { leg1_fill_price, .. } => Some(*leg1_fill_price),
             _ => None,
@@ -432,8 +326,7 @@ impl LegManager {
 
     pub fn leg1_fill_shares(&self) -> Option<f64> {
         match &self.state {
-            LegState::Scanning { leg1_shares, .. }
-            | LegState::Leg2Pending { leg1_shares, .. } => Some(*leg1_shares),
+            LegState::Leg2Pending { leg1_shares, .. } => Some(*leg1_shares),
             LegState::Locked { shares, .. }
             | LegState::ForceClose { shares, .. } => Some(*shares),
             _ => None,
@@ -444,7 +337,6 @@ impl LegManager {
         match &self.state {
             LegState::Idle => "N/A".to_string(),
             LegState::Leg1Pending { .. } => "Leg1 pending".to_string(),
-            LegState::Scanning { .. } => "Scanning for Leg2".to_string(),
             LegState::Leg2Pending { leg2_target_price, .. } => {
                 format!("Leg2 pending @ {:.4}", leg2_target_price)
             }
@@ -465,8 +357,7 @@ impl LegManager {
     /// Estimate unrealised PnL based on current token prices.
     pub fn unrealised_pnl(&self, yes_price: f64, no_price: f64) -> f64 {
         match &self.state {
-            LegState::Scanning { signal, leg1_fill_price, leg1_shares, .. }
-            | LegState::Leg2Pending { signal, leg1_fill_price, leg1_shares: leg1_shares, .. } => {
+            LegState::Leg2Pending { signal, leg1_fill_price, leg1_shares, .. } => {
                 let current_value = match signal.leg1_side {
                     Leg1Side::Yes => yes_price,
                     Leg1Side::No => no_price,

@@ -32,6 +32,7 @@ pub struct Config {
     pub leg2_wait_secs: u64,
     pub leg2_min_wait_secs: u64,
     pub force_close_secs: u64,
+    pub min_profit_margin: f64,
 
     // Risk
     pub max_concurrent_positions: usize,
@@ -98,6 +99,7 @@ impl Config {
             leg2_wait_secs: parse_u64("LEG2_WAIT_SECS", 15)?,
             leg2_min_wait_secs: parse_u64("LEG2_MIN_WAIT_SECS", 3)?,
             force_close_secs: parse_u64("FORCE_CLOSE_SECS", 10)?,
+            min_profit_margin: parse_f64("MIN_PROFIT_MARGIN", 0.01)?,
 
             // Risk
             max_concurrent_positions: parse_u64("MAX_CONCURRENT_POSITIONS", 3)? as usize,

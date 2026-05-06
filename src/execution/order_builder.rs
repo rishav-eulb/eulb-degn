@@ -57,14 +57,21 @@ pub enum OrderRequestKind {
     ForceClose,
 }
 
-/// Builds and submits orders via the Polymarket CLOB SDK.
-/// Caches the authenticated client across orders to avoid re-authentication overhead.
-pub struct OrderExecutor {
+/// Shared inner state for concurrent order execution.
+struct OrderExecutorInner {
     clob_url: String,
     funder_address: Option<String>,
     dry_run: bool,
-    cached_client: Arc<Mutex<Option<AuthenticatedClient>>>,
+    cached_client: Mutex<Option<AuthenticatedClient>>,
     signer: PrivateKeySigner,
+}
+
+/// Builds and submits orders via the Polymarket CLOB SDK.
+/// Caches the authenticated client across orders to avoid re-authentication overhead.
+/// Cheaply cloneable via internal Arc for concurrent order dispatch.
+#[derive(Clone)]
+pub struct OrderExecutor {
+    inner: Arc<OrderExecutorInner>,
 }
 
 impl OrderExecutor {
@@ -78,36 +85,50 @@ impl OrderExecutor {
             .context("Invalid private key")?
             .with_chain_id(Some(POLYGON));
         Ok(Self {
-            clob_url,
-            funder_address,
-            dry_run,
-            cached_client: Arc::new(Mutex::new(None)),
-            signer,
+            inner: Arc::new(OrderExecutorInner {
+                clob_url,
+                funder_address,
+                dry_run,
+                cached_client: Mutex::new(None),
+                signer,
+            }),
         })
+    }
+
+    /// Pre-authenticate with the CLOB so the first order doesn't pay auth latency.
+    pub async fn warm(&self) -> Result<()> {
+        let _client = self.get_client().await?;
+        info!("CLOB client pre-warmed (authenticated)");
+        Ok(())
     }
 
     /// Spawn the background executor task. Returns a sender to submit order requests,
     /// and a receiver for completed order results.
+    /// Each incoming request is dispatched to its own tokio task for concurrent execution.
     pub fn spawn(self) -> (mpsc::UnboundedSender<OrderRequest>, mpsc::UnboundedReceiver<(String, OrderRequestKind, Result<OrderResult>)>) {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<OrderRequest>();
         let (result_tx, result_rx) = mpsc::unbounded_channel::<(String, OrderRequestKind, Result<OrderResult>)>();
 
         tokio::spawn(async move {
             while let Some(request) = req_rx.recv().await {
-                match request {
-                    OrderRequest::Leg1Market { token_id, size_usd, asset_key, hint_price, .. } => {
-                        let result = self.execute_leg1(&token_id, size_usd, hint_price).await;
-                        let _ = result_tx.send((asset_key, OrderRequestKind::Leg1, result));
+                let executor = self.clone();
+                let tx = result_tx.clone();
+                tokio::spawn(async move {
+                    match request {
+                        OrderRequest::Leg1Market { token_id, size_usd, asset_key, hint_price, .. } => {
+                            let result = executor.execute_leg1(&token_id, size_usd, hint_price).await;
+                            let _ = tx.send((asset_key, OrderRequestKind::Leg1, result));
+                        }
+                        OrderRequest::Leg2Limit { token_id, price, shares, asset_key } => {
+                            let result = executor.execute_leg2(&token_id, price, shares).await;
+                            let _ = tx.send((asset_key, OrderRequestKind::Leg2, result));
+                        }
+                        OrderRequest::ForceClose { token_id, shares, asset_key } => {
+                            let result = executor.execute_force_close(&token_id, shares).await;
+                            let _ = tx.send((asset_key, OrderRequestKind::ForceClose, result));
+                        }
                     }
-                    OrderRequest::Leg2Limit { token_id, price, shares, asset_key } => {
-                        let result = self.execute_leg2(&token_id, price, shares).await;
-                        let _ = result_tx.send((asset_key, OrderRequestKind::Leg2, result));
-                    }
-                    OrderRequest::ForceClose { token_id, shares, asset_key } => {
-                        let result = self.execute_force_close(&token_id, shares).await;
-                        let _ = result_tx.send((asset_key, OrderRequestKind::ForceClose, result));
-                    }
-                }
+                });
             }
         });
 
@@ -117,7 +138,7 @@ impl OrderExecutor {
     async fn execute_leg1(&self, token_id: &str, size_usd: f64, hint_price: Option<f64>) -> Result<OrderResult> {
         info!(token_id, size_usd, ?hint_price, "Placing Leg1 FOK market order");
 
-        if self.dry_run {
+        if self.inner.dry_run {
             debug!("DRY RUN — simulating Leg1 fill at 0.50");
             return Ok(OrderResult::Filled {
                 fill_price: 0.50,
@@ -133,7 +154,7 @@ impl OrderExecutor {
     async fn execute_leg2(&self, token_id: &str, price: f64, shares: f64) -> Result<OrderResult> {
         info!(token_id, price, shares, "Placing Leg2 limit order (maker)");
 
-        if self.dry_run {
+        if self.inner.dry_run {
             debug!("DRY RUN — simulating Leg2 fill");
             return Ok(OrderResult::Filled { fill_price: price, shares });
         }
@@ -146,39 +167,35 @@ impl OrderExecutor {
     async fn execute_force_close(&self, token_id: &str, shares: f64) -> Result<OrderResult> {
         info!(token_id, shares, "Force-closing Leg1 at market");
 
-        if self.dry_run {
+        if self.inner.dry_run {
             debug!("DRY RUN — simulating force close");
             return Ok(OrderResult::Filled { fill_price: 0.50, shares });
         }
 
         let size_dec = rust_decimal::Decimal::from_f64(shares)
             .context("Invalid close shares")?
-            .trunc_with_scale(2); // SDK requires <= 2 decimal places for shares
-        // Use aggressive minimum price hint to skip book fetch — force-close accepts any fill.
+            .trunc_with_scale(2);
         let aggressive_price = Some(dec!(0.01));
         self.execute_market_order(token_id, Side::Sell, size_dec, aggressive_price).await
     }
 
-    /// Get or create the cached authenticated client.
-    /// On auth failure, invalidates the cache and retries once.
     async fn get_client(&self) -> Result<AuthenticatedClient> {
         {
-            let guard = self.cached_client.lock().await;
+            let guard = self.inner.cached_client.lock().await;
             if let Some(ref client) = *guard {
                 return Ok(client.clone());
             }
         }
 
         let client = self.authenticate_fresh().await?;
-        let mut guard = self.cached_client.lock().await;
+        let mut guard = self.inner.cached_client.lock().await;
         *guard = Some(client.clone());
         Ok(client)
     }
 
-    /// Invalidate the cached client and re-authenticate.
     async fn refresh_client(&self) -> Result<AuthenticatedClient> {
         let client = self.authenticate_fresh().await?;
-        let mut guard = self.cached_client.lock().await;
+        let mut guard = self.inner.cached_client.lock().await;
         *guard = Some(client.clone());
         info!("CLOB client re-authenticated (cache refreshed)");
         Ok(client)
@@ -187,16 +204,16 @@ impl OrderExecutor {
     fn authenticate_fresh(&self) -> impl std::future::Future<Output = Result<AuthenticatedClient>> + '_ {
         async {
             let config = ClobConfig::builder().use_server_time(false).build();
-            let mut auth_builder = ClobClient::new(&self.clob_url, config)
+            let mut auth_builder = ClobClient::new(&self.inner.clob_url, config)
                 .context("Failed to create CLOB client")?
-                .authentication_builder(&self.signer);
+                .authentication_builder(&self.inner.signer);
 
-            if let Some(ref funder) = self.funder_address {
+            if let Some(ref funder) = self.inner.funder_address {
                 let addr: Address = funder.parse().context("Invalid funder address")?;
                 auth_builder = auth_builder
                     .funder(addr)
-                    .signature_type(SignatureType::GnosisSafe);
-                debug!(funder = %addr, "Using GnosisSafe wallet as funder");
+                    .signature_type(SignatureType::Poly1271);
+                debug!(funder = %addr, "Using deposit wallet as funder (Poly1271)");
             }
 
             auth_builder
@@ -206,9 +223,6 @@ impl OrderExecutor {
         }
     }
 
-    /// Execute a market order. When `hint_price` is provided, passes it to the SDK's
-    /// market_order builder via `.price()` which skips the internal order book fetch (~1 RTT saved).
-    /// For Buy orders, `amount` is USDC to spend. For Sell orders, `amount` is shares to sell.
     async fn execute_market_order(
         &self,
         token_id: &str,
@@ -239,7 +253,7 @@ impl OrderExecutor {
         let order = builder.build().await.context("Failed to build market order")?;
 
         let signed_order = client
-            .sign(&self.signer, order)
+            .sign(&self.inner.signer, order)
             .await
             .context("Failed to sign market order")?;
 
@@ -267,7 +281,7 @@ impl OrderExecutor {
                     }
                     let order = builder.build().await.context("Failed to rebuild market order")?;
                     let signed_order = client
-                        .sign(&self.signer, order)
+                        .sign(&self.inner.signer, order)
                         .await
                         .context("Failed to re-sign market order")?;
                     client.post_order(signed_order).await.context("Retry post_order failed")?
@@ -309,7 +323,7 @@ impl OrderExecutor {
             .context("Failed to build limit order")?;
 
         let signed_order = client
-            .sign(&self.signer, order)
+            .sign(&self.inner.signer, order)
             .await
             .context("Failed to sign limit order")?;
 
@@ -332,7 +346,7 @@ impl OrderExecutor {
                         .await
                         .context("Failed to rebuild limit order")?;
                     let signed_order = client
-                        .sign(&self.signer, order)
+                        .sign(&self.inner.signer, order)
                         .await
                         .context("Failed to re-sign limit order")?;
                     client.post_order(signed_order).await.context("Retry post_order failed")?

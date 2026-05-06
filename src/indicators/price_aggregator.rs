@@ -53,36 +53,34 @@ impl PriceAggregator {
         }
     }
 
-    /// Update Chainlink price for an asset.
+    /// Update Chainlink price for an asset. Caller should pass pre-uppercased keys.
     pub fn update_chainlink(&mut self, asset: &str, price: f64, ts: DateTime<Utc>) {
         self.chainlink_prices.insert(
-            asset.to_uppercase(),
+            asset.to_string(),
             TimestampedPrice { price, timestamp: ts },
         );
     }
 
-    /// Update Hyperliquid mid-price for an asset.
+    /// Update Hyperliquid mid-price for an asset. Caller should pass pre-uppercased keys.
     pub fn update_hl_mid(&mut self, asset: &str, price: f64, ts: DateTime<Utc>) {
         self.hl_mid_prices.insert(
-            asset.to_uppercase(),
+            asset.to_string(),
             TimestampedPrice { price, timestamp: ts },
         );
     }
 
     /// Snapshot the market open price from the best available source.
-    /// Called at T=0 of each 5-min interval.
     pub fn snapshot_open_price(&mut self, asset: &str) {
         if let Some(price) = self.get_best_price(asset) {
             self.market_open_prices
-                .insert(asset.to_uppercase(), price.price);
+                .insert(asset.to_string(), price.price);
         }
     }
 
     /// Get the current price state for an asset using the best available source.
     pub fn get_state(&self, asset: &str) -> Option<PriceState> {
-        let key = asset.to_uppercase();
-        let best = self.get_best_price(&key)?;
-        let open = self.market_open_prices.get(&key)?;
+        let best = self.get_best_price(asset)?;
+        let open = self.market_open_prices.get(asset)?;
 
         let bps_from_open = if *open > 0.0 {
             (best.price - open) / open * 10_000.0
@@ -90,14 +88,14 @@ impl PriceAggregator {
             0.0
         };
 
-        let source = if self.chainlink_enabled && self.chainlink_prices.contains_key(&key) {
+        let source = if self.chainlink_enabled && self.chainlink_prices.contains_key(asset) {
             PriceSource::Chainlink
         } else {
             PriceSource::Hyperliquid
         };
 
         Some(PriceState {
-            asset: key,
+            asset: asset.to_string(),
             price: best.price,
             source,
             bps_from_open,
@@ -107,16 +105,13 @@ impl PriceAggregator {
 
     /// Returns the best available price: Chainlink if enabled and fresh, else Hyperliquid.
     fn get_best_price(&self, asset: &str) -> Option<TimestampedPrice> {
-        let key = asset.to_uppercase();
-
         if self.chainlink_enabled {
-            if let Some(cl) = self.chainlink_prices.get(&key) {
+            if let Some(cl) = self.chainlink_prices.get(asset) {
                 return Some(*cl);
             }
         }
 
-        // Fallback to Hyperliquid
-        self.hl_mid_prices.get(&key).copied()
+        self.hl_mid_prices.get(asset).copied()
     }
 
     /// Clear open prices (called when rotating to a new market interval).
@@ -126,8 +121,7 @@ impl PriceAggregator {
 
     /// Check if we have any price data for the given asset.
     pub fn has_price(&self, asset: &str) -> bool {
-        let key = asset.to_uppercase();
-        self.chainlink_prices.contains_key(&key) || self.hl_mid_prices.contains_key(&key)
+        self.chainlink_prices.contains_key(asset) || self.hl_mid_prices.contains_key(asset)
     }
 }
 

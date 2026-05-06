@@ -6,6 +6,6 @@ pub mod tracker;
 
 pub use order_builder::{OrderExecutor, OrderRequest, OrderRequestKind, OrderResult};
 pub use portfolio::{ActiveTrade, PortfolioState, RiskStatus, TradeLogEntry};
-pub use redeemer::Redeemer;
+pub use redeemer::{RedeemCommand, Redeemer};
 pub use risk::RiskManager;
 pub use tracker::OrderTracker;

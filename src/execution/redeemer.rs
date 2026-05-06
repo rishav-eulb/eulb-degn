@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// CTF contract on Polygon for standard (non-negative-risk) markets.
@@ -48,6 +49,16 @@ struct RedeemResponse {
     #[serde(rename = "transactionHash")]
     transaction_hash: Option<String>,
     error: Option<String>,
+}
+
+/// Command sent to the background redeemer task.
+#[derive(Debug)]
+pub enum RedeemCommand {
+    Schedule {
+        condition_id: String,
+        slug: String,
+        market_end_ts: DateTime<Utc>,
+    },
 }
 
 /// Request body for the Polymarket Builder Relayer redeem endpoint.
@@ -165,6 +176,34 @@ impl Redeemer {
     /// Number of pending redemptions.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Move the redeemer into its own background task so it never blocks the main loop.
+    /// Returns a sender for scheduling new redemptions.
+    pub fn spawn(mut self) -> mpsc::UnboundedSender<RedeemCommand> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RedeemCommand>();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    Some(cmd) = rx.recv() => {
+                        match cmd {
+                            RedeemCommand::Schedule { condition_id, slug, market_end_ts } => {
+                                self.schedule_redemption(condition_id, slug, market_end_ts);
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        let redeemed = self.tick().await;
+                        if redeemed > 0 {
+                            info!(count = redeemed, "Redeemed positions");
+                        }
+                    }
+                }
+            }
+        });
+        tx
     }
 
     /// Execute the actual redemption call.

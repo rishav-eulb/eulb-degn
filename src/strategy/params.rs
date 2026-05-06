@@ -27,6 +27,8 @@ pub struct StrategyParams {
     pub taker_fee_rate: f64,
     /// Fee rate for maker orders (0%).
     pub maker_fee_rate: f64,
+    /// Minimum profit margin per share for Leg2 lock (e.g. 0.01 = 1 cent).
+    pub min_profit_margin: f64,
 }
 
 impl Default for StrategyParams {
@@ -45,6 +47,7 @@ impl Default for StrategyParams {
             slippage_cents: 0.01,
             taker_fee_rate: 0.02,
             maker_fee_rate: 0.0,
+            min_profit_margin: 0.05,
         }
     }
 }
@@ -65,6 +68,7 @@ impl StrategyParams {
             slippage_cents: 0.01,
             taker_fee_rate: 0.02,
             maker_fee_rate: 0.0,
+            min_profit_margin: cfg.min_profit_margin,
         }
     }
 }

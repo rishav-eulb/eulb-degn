@@ -81,11 +81,14 @@ const MSG_LOG_LIMIT: u64 = 20;
 
 /// Runs the Polymarket CLOB WebSocket for orderbook data.
 /// Subscribes to orderbook updates for the given token IDs.
+/// Accepts a `sub_rx` channel for incremental subscription of new token IDs
+/// without tearing down the connection.
 /// Sends PING every 10s to keep the connection alive.
 pub async fn run_poly_clob_ws(
     ws_url: &str,
     token_ids: Vec<String>,
     tx: mpsc::UnboundedSender<PolyEvent>,
+    mut sub_rx: mpsc::UnboundedReceiver<Vec<String>>,
 ) -> Result<()> {
     loop {
         info!("Connecting to Polymarket CLOB WebSocket...");
@@ -95,7 +98,6 @@ pub async fn run_poly_clob_ws(
                 info!("Connected to Polymarket CLOB WebSocket");
                 let (mut write, mut read) = ws_stream.split();
 
-                // Subscribe to market data for all tokens at once
                 let sub_msg = serde_json::json!({
                     "assets_ids": &token_ids,
                     "type": "market",
@@ -108,7 +110,6 @@ pub async fn run_poly_clob_ws(
                     error!(error = %e, "Failed to subscribe to Poly market channel");
                 }
 
-                // Heartbeat ticker — Polymarket requires PING every 10s
                 let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
                 ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -120,10 +121,24 @@ pub async fn run_poly_clob_ws(
                                 break;
                             }
                         }
+                        Some(new_ids) = sub_rx.recv() => {
+                            if new_ids.is_empty() {
+                                continue;
+                            }
+                            info!(count = new_ids.len(), "Adding incremental Poly WS subscriptions");
+                            let sub_msg = serde_json::json!({
+                                "assets_ids": &new_ids,
+                                "type": "market",
+                                "custom_feature_enabled": true
+                            });
+                            if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
+                                warn!(error = %e, "Failed to send incremental subscription");
+                                break;
+                            }
+                        }
                         msg_opt = read.next() => {
                             match msg_opt {
                                 Some(Ok(Message::Text(text))) => {
-                                    // Log first N messages for diagnostics
                                     let count = MSG_LOG_CTR.fetch_add(1, Ordering::Relaxed);
                                     if count < MSG_LOG_LIMIT {
                                         info!(
@@ -226,18 +241,6 @@ pub async fn run_poly_rtds(
         warn!("RTDS WS disconnected, reconnecting in 3s...");
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-}
-
-/// Subscribe to new token_ids on an existing CLOB WebSocket.
-pub async fn subscribe_tokens(
-    _ws_url: &str,
-    new_token_ids: &[String],
-) -> Result<()> {
-    debug!(
-        count = new_token_ids.len(),
-        "Subscribing to new Polymarket tokens"
-    );
-    Ok(())
 }
 
 fn process_clob_message(

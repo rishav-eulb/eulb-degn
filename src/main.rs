@@ -10,12 +10,11 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::execution::{
     ActiveTrade, OrderExecutor, OrderRequest, OrderRequestKind, OrderResult, OrderTracker,
-    PortfolioState, Redeemer, RiskManager, RiskStatus,
+    PortfolioState, RedeemCommand, Redeemer, RiskManager, RiskStatus,
 };
 use crate::feeds::chainlink::FeedConfig;
 use crate::feeds::{HlEvent, PolyEvent};
@@ -34,7 +33,7 @@ async fn main() -> Result<()> {
                     format!("polymarket_bot={}", cfg.log_level).parse().unwrap()
                 }),
         )
-        .json()
+        .compact()
         .init();
 
     info!("Polymarket Two-Leg Trading Bot starting...");
@@ -118,13 +117,19 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
         cfg.polymarket_funder_address.clone(),
         cfg.dry_run,
     )?;
+    if !cfg.dry_run {
+        if let Err(e) = executor.warm().await {
+            warn!(error = %e, "Failed to pre-warm CLOB client (will retry on first order)");
+        }
+    }
     let (order_tx, mut order_rx) = executor.spawn();
 
-    let mut redeemer = Redeemer::new(
+    let redeemer = Redeemer::new(
         cfg.polymarket_clob_url.clone(),
         cfg.polymarket_private_key.clone(),
         cfg.dry_run,
     );
+    let redeem_tx = redeemer.spawn();
 
     // --- Active market state per asset ---
     let mut active_markets: std::collections::HashMap<String, ActiveMarketState> =
@@ -175,16 +180,19 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
     let mut state_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     state_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut redeem_ticker = tokio::time::interval(std::time::Duration::from_secs(15));
-    redeem_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     // --- Main event loop ---
     info!("Entering main event loop");
 
     let mut token_prices: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
 
-    let mut poly_ws_handles: Vec<JoinHandle<()>> = Vec::new();
+    // Polymarket WS with incremental subscription channel
+    let (poly_sub_tx, poly_sub_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    let poly_tx_clone = poly_tx.clone();
+    let ws_url_clone = poly_ws_url.clone();
+    tokio::spawn(async move {
+        let _ = feeds::run_poly_clob_ws(&ws_url_clone, vec![], poly_tx_clone, poly_sub_rx).await;
+    });
 
     loop {
         tokio::select! {
@@ -197,7 +205,15 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                 Ok(OrderResult::Filled { fill_price, shares }) => {
                                     info!(fill_price, shares, asset = asset_key.as_str(), "Leg1 filled");
                                     risk_mgr.on_position_opened(&asset_key);
-                                    state.leg_manager.on_leg1_fill(fill_price, shares);
+                                    let action = state.leg_manager.on_leg1_fill(fill_price, shares);
+                                    if let LegAction::PlaceLeg2 { token_id, price, shares } = &action {
+                                        let _ = order_tx.send(OrderRequest::Leg2Limit {
+                                            token_id: token_id.clone(),
+                                            price: *price,
+                                            shares: *shares,
+                                            asset_key: asset_key.clone(),
+                                        });
+                                    }
                                 }
                                 Ok(OrderResult::Rejected { reason }) => {
                                     warn!(reason, asset = asset_key.as_str(), "Leg1 rejected");
@@ -218,11 +234,27 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                 }
                                 Ok(OrderResult::Rejected { reason }) => {
                                     warn!(reason, asset = asset_key.as_str(), "Leg2 rejected");
-                                    state.leg_manager.on_leg2_rejected();
+                                    let action = state.leg_manager.on_leg2_rejected();
+                                    if let LegAction::PlaceLeg2 { token_id, price, shares } = &action {
+                                        let _ = order_tx.send(OrderRequest::Leg2Limit {
+                                            token_id: token_id.clone(),
+                                            price: *price,
+                                            shares: *shares,
+                                            asset_key: asset_key.clone(),
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     error!(error = %e, asset = asset_key.as_str(), "Leg2 order error");
-                                    state.leg_manager.on_leg2_rejected();
+                                    let action = state.leg_manager.on_leg2_rejected();
+                                    if let LegAction::PlaceLeg2 { token_id, price, shares } = &action {
+                                        let _ = order_tx.send(OrderRequest::Leg2Limit {
+                                            token_id: token_id.clone(),
+                                            price: *price,
+                                            shares: *shares,
+                                            asset_key: asset_key.clone(),
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
@@ -243,21 +275,14 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                 }
             }
 
-            // Periodic redemption check
-            _ = redeem_ticker.tick() => {
-                let redeemed = redeemer.tick().await;
-                if redeemed > 0 {
-                    info!(count = redeemed, "Redeemed positions");
-                }
-            }
-
-            // Periodic portfolio state dump
+            // Periodic portfolio state dump (offloaded to background task)
             _ = state_ticker.tick() => {
+                let now = Utc::now();
                 let active_trades: Vec<ActiveTrade> = active_markets.iter().filter_map(|(asset, state)| {
                     if state.leg_manager.is_idle() {
                         return None;
                     }
-                    let secs_since_entry = (Utc::now() - state.open_ts).num_seconds().max(0) as u64;
+                    let secs_since_entry = (now - state.open_ts).num_seconds().max(0) as u64;
                     let secs_to_expiry = interval_secs.saturating_sub(secs_since_entry);
                     Some(ActiveTrade {
                         asset: asset.clone(),
@@ -284,8 +309,8 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                 let unrealised_total: f64 = active_trades.iter().map(|t| t.unrealised_pnl).sum();
 
                 let portfolio = PortfolioState {
-                    timestamp: Utc::now(),
-                    uptime_secs: (Utc::now() - boot_time).num_seconds().max(0) as u64,
+                    timestamp: now,
+                    uptime_secs: (now - boot_time).num_seconds().max(0) as u64,
                     total_realised_pnl: tracker.total_realised_pnl(),
                     unrealised_pnl: unrealised_total,
                     daily_pnl: tracker.daily_pnl(),
@@ -304,7 +329,10 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                         open_positions_eth: risk_mgr.open_positions("ETH"),
                     },
                 };
-                execution::portfolio::write_state(&portfolio, &state_file).await;
+                let sf = state_file.clone();
+                tokio::spawn(async move {
+                    execution::portfolio::write_state(&portfolio, &sf).await;
+                });
             }
 
             // New market discovered
@@ -321,18 +349,18 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                 if let Some(prev_state) = active_markets.get(&asset) {
                     let market_end = prev_state.open_ts
                         + chrono::Duration::seconds(interval_secs as i64);
-                    redeemer.schedule_redemption(
-                        prev_state.market_info.condition_id.clone(),
-                        prev_state.market_info.slug.clone(),
-                        market_end,
-                    );
+                    let _ = redeem_tx.send(RedeemCommand::Schedule {
+                        condition_id: prev_state.market_info.condition_id.clone(),
+                        slug: prev_state.market_info.slug.clone(),
+                        market_end_ts: market_end,
+                    });
                 }
 
                 price_agg.snapshot_open_price(&asset);
 
                 let params = StrategyParams::from_config(&cfg, &asset);
                 let leg_mgr = LegManager::new(
-                    params,
+                    params.clone(),
                     market_info.yes_token_id.clone(),
                     market_info.no_token_id.clone(),
                     Utc::now(),
@@ -342,26 +370,15 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                 active_markets.insert(asset, ActiveMarketState {
                     market_info: market_info.clone(),
                     leg_manager: leg_mgr,
+                    params,
                     open_ts: Utc::now(),
                 });
 
-                for handle in poly_ws_handles.drain(..) {
-                    handle.abort();
-                }
-
-                let all_token_ids: Vec<String> = active_markets.values()
-                    .flat_map(|s| vec![
-                        s.market_info.yes_token_id.clone(),
-                        s.market_info.no_token_id.clone(),
-                    ])
-                    .collect();
-
-                let poly_tx_clone = poly_tx.clone();
-                let ws_url = poly_ws_url.clone();
-                let handle = tokio::spawn(async move {
-                    let _ = feeds::run_poly_clob_ws(&ws_url, all_token_ids, poly_tx_clone).await;
-                });
-                poly_ws_handles.push(handle);
+                let new_token_ids = vec![
+                    market_info.yes_token_id.clone(),
+                    market_info.no_token_id.clone(),
+                ];
+                let _ = poly_sub_tx.send(new_token_ids);
             }
 
             // Hyperliquid event (primary price source + microstructure)
@@ -384,12 +401,13 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                         }
                         book_imbalance.update(&snapshot);
 
-                        let asset_key = snapshot.asset.clone();
-                        if let Some(state) = active_markets.get_mut(&asset_key) {
+                        let asset_key = &snapshot.asset;
+                        if let Some(state) = active_markets.get_mut(asset_key) {
                             if state.leg_manager.is_idle() {
-                                if let Some(price_state) = price_agg.get_state(&asset_key) {
-                                    if let Some(imb) = book_imbalance.get(&asset_key) {
-                                        let secs_open = (Utc::now() - state.open_ts).num_seconds().max(0) as u64;
+                                if let Some(price_state) = price_agg.get_state(asset_key) {
+                                    if let Some(imb) = book_imbalance.get(asset_key) {
+                                        let now = Utc::now();
+                                        let secs_open = (now - state.open_ts).num_seconds().max(0) as u64;
                                         static TICK_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                                         let tick = TICK_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if tick % 50 == 0 {
@@ -422,8 +440,7 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                             .unwrap_or(0.5);
 
                                         let secs_since_open =
-                                            (Utc::now() - state.open_ts).num_seconds().max(0) as u64;
-                                        let params = StrategyParams::from_config(&cfg, &asset_key);
+                                            (now - state.open_ts).num_seconds().max(0) as u64;
 
                                         if let Some(signal) = evaluate_entry(
                                             &price_state,
@@ -431,10 +448,10 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                             yes_price,
                                             no_price,
                                             secs_since_open,
-                                            &params,
+                                            &state.params,
                                         ) {
                                             if let Err(veto) = risk_mgr.check_entry(
-                                                &asset_key,
+                                                asset_key,
                                                 tracker.daily_pnl(),
                                                 tracker.consecutive_losses(),
                                             ) {
@@ -469,10 +486,10 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                             token_prices.insert(book.token_id.clone(), best_ask.price);
                         }
 
+                        let now = Utc::now();
                         for (asset_key, state) in active_markets.iter_mut() {
                             let opposite_token_id = match state.leg_manager.state {
-                                strategy::LegState::Scanning { ref signal, .. }
-                                | strategy::LegState::Leg2Pending { ref signal, .. } => {
+                                strategy::LegState::Leg2Pending { ref signal, .. } => {
                                     match signal.leg1_side {
                                         strategy::Leg1Side::Yes => &state.market_info.no_token_id,
                                         strategy::Leg1Side::No => &state.market_info.yes_token_id,
@@ -483,24 +500,13 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
 
                             if book.token_id == *opposite_token_id {
                                 if let Some(best_ask) = book.asks.first() {
-                                    let action = state.leg_manager.on_tick(best_ask.price, Utc::now());
-                                    match &action {
-                                        LegAction::PlaceLeg2 { token_id, price, shares } => {
-                                            let _ = order_tx.send(OrderRequest::Leg2Limit {
-                                                token_id: token_id.clone(),
-                                                price: *price,
-                                                shares: *shares,
-                                                asset_key: asset_key.clone(),
-                                            });
-                                        }
-                                        LegAction::ForceCloseLeg1 { token_id, shares } => {
-                                            let _ = order_tx.send(OrderRequest::ForceClose {
-                                                token_id: token_id.clone(),
-                                                shares: *shares,
-                                                asset_key: asset_key.clone(),
-                                            });
-                                        }
-                                        _ => {}
+                                    let action = state.leg_manager.on_tick(best_ask.price, now);
+                                    if let LegAction::ForceCloseLeg1 { token_id, shares } = &action {
+                                        let _ = order_tx.send(OrderRequest::ForceClose {
+                                            token_id: token_id.clone(),
+                                            shares: *shares,
+                                            asset_key: asset_key.clone(),
+                                        });
                                     }
                                 }
                             }
@@ -518,5 +524,6 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
 struct ActiveMarketState {
     market_info: MarketInfo,
     leg_manager: LegManager,
+    params: StrategyParams,
     open_ts: chrono::DateTime<Utc>,
 }

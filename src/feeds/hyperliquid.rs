@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -45,10 +45,14 @@ pub enum HlEvent {
     Trade(HlTrade),
 }
 
+/// Single-pass tagged deserialization -- avoids intermediate serde_json::Value allocation.
 #[derive(Debug, Deserialize)]
-struct WsResponse {
-    channel: Option<String>,
-    data: Option<serde_json::Value>,
+#[serde(tag = "channel")]
+enum TypedWsResponse {
+    #[serde(rename = "l2Book")]
+    L2Book { data: L2BookData },
+    #[serde(rename = "trades")]
+    Trades { data: Vec<TradeEntry> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,26 +62,34 @@ struct L2BookData {
     time: Option<u64>,
 }
 
+/// Price level with string-to-f64 deserialization done inline via serde helper.
 #[derive(Debug, Deserialize)]
 struct LevelEntry {
-    px: String,
-    sz: String,
+    #[serde(deserialize_with = "deser_f64_from_str")]
+    px: f64,
+    #[serde(deserialize_with = "deser_f64_from_str")]
+    sz: f64,
+    #[allow(dead_code)]
     n: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TradesData {
-    #[serde(default)]
-    trades: Vec<TradeEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TradeEntry {
     coin: String,
-    px: String,
-    sz: String,
+    #[serde(deserialize_with = "deser_f64_from_str")]
+    px: f64,
+    #[serde(deserialize_with = "deser_f64_from_str")]
+    sz: f64,
     side: String,
     time: u64,
+}
+
+fn deser_f64_from_str<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = <&str>::deserialize(deserializer)?;
+    s.parse::<f64>().map_err(serde::de::Error::custom)
 }
 
 /// Spawns a Hyperliquid WebSocket that streams L2 book snapshots and trades.
@@ -94,36 +106,25 @@ pub async fn run_hyperliquid_feed(
                 info!("Connected to Hyperliquid WebSocket");
                 let (mut write, mut read) = ws_stream.split();
 
-                // Subscribe to L2 book for each asset
+                // Batch all subscriptions and flush once
                 for asset in assets {
-                    let sub_msg = serde_json::json!({
+                    let book_sub = serde_json::json!({
                         "method": "subscribe",
-                        "subscription": {
-                            "type": "l2Book",
-                            "coin": asset
-                        }
+                        "subscription": { "type": "l2Book", "coin": asset }
                     });
-                    if let Err(e) = write
-                        .send(Message::Text(sub_msg.to_string()))
-                        .await
-                    {
-                        error!(asset, error = %e, "Failed to subscribe to HL L2 book");
-                    }
-
-                    // Subscribe to trades
                     let trade_sub = serde_json::json!({
                         "method": "subscribe",
-                        "subscription": {
-                            "type": "trades",
-                            "coin": asset
-                        }
+                        "subscription": { "type": "trades", "coin": asset }
                     });
-                    if let Err(e) = write
-                        .send(Message::Text(trade_sub.to_string()))
-                        .await
-                    {
-                        error!(asset, error = %e, "Failed to subscribe to HL trades");
+                    if let Err(e) = write.feed(Message::Text(book_sub.to_string())).await {
+                        error!(asset, error = %e, "Failed to buffer HL L2 book subscription");
                     }
+                    if let Err(e) = write.feed(Message::Text(trade_sub.to_string())).await {
+                        error!(asset, error = %e, "Failed to buffer HL trades subscription");
+                    }
+                }
+                if let Err(e) = write.flush().await {
+                    error!(error = %e, "Failed to flush HL subscription batch");
                 }
 
                 while let Some(msg_result) = read.next().await {
@@ -162,31 +163,21 @@ fn process_hl_message(
     text: &str,
     tx: &mpsc::UnboundedSender<HlEvent>,
 ) -> Result<()> {
-    let resp: WsResponse =
-        serde_json::from_str(text).context("Parse HL WS message")?;
-
-    match resp.channel.as_deref() {
-        Some("l2Book") => {
-            if let Some(data) = resp.data {
-                let book: L2BookData =
-                    serde_json::from_value(data).context("Parse L2 book")?;
-                let snapshot = parse_book_snapshot(book);
-                let _ = tx.send(HlEvent::Book(snapshot));
+    match serde_json::from_str::<TypedWsResponse>(text) {
+        Ok(TypedWsResponse::L2Book { data }) => {
+            let snapshot = parse_book_snapshot(data);
+            let _ = tx.send(HlEvent::Book(snapshot));
+        }
+        Ok(TypedWsResponse::Trades { data }) => {
+            for entry in data {
+                let trade = parse_trade(entry);
+                let _ = tx.send(HlEvent::Trade(trade));
             }
         }
-        Some("trades") => {
-            if let Some(data) = resp.data {
-                let trades: Vec<TradeEntry> =
-                    serde_json::from_value(data).context("Parse trades")?;
-                for entry in trades {
-                    let trade = parse_trade(entry);
-                    let _ = tx.send(HlEvent::Trade(trade));
-                }
-            }
+        Err(_) => {
+            // Non-data messages (subscriptions, pongs, etc.) -- ignore silently
         }
-        _ => {}
     }
-
     Ok(())
 }
 
@@ -202,12 +193,7 @@ fn parse_book_snapshot(book: L2BookData) -> HlBookSnapshot {
         .map(|levels| {
             levels
                 .iter()
-                .filter_map(|l| {
-                    Some(PriceLevel {
-                        price: l.px.parse().ok()?,
-                        size: l.sz.parse().ok()?,
-                    })
-                })
+                .map(|l| PriceLevel { price: l.px, size: l.sz })
                 .collect()
         })
         .unwrap_or_default();
@@ -218,12 +204,7 @@ fn parse_book_snapshot(book: L2BookData) -> HlBookSnapshot {
         .map(|levels| {
             levels
                 .iter()
-                .filter_map(|l| {
-                    Some(PriceLevel {
-                        price: l.px.parse().ok()?,
-                        size: l.sz.parse().ok()?,
-                    })
-                })
+                .map(|l| PriceLevel { price: l.px, size: l.sz })
                 .collect()
         })
         .unwrap_or_default();
@@ -242,8 +223,8 @@ fn parse_trade(entry: TradeEntry) -> HlTrade {
 
     HlTrade {
         asset: entry.coin,
-        price: entry.px.parse().unwrap_or(0.0),
-        size: entry.sz.parse().unwrap_or(0.0),
+        price: entry.px,
+        size: entry.sz,
         side: if entry.side == "B" {
             TradeSide::Buy
         } else {
