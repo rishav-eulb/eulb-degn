@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Polymarket SDK
-polymarket_client_sdk_v2 = { version = "0.5", features = ["clob", "ws", "rtds", "gamma", "ctf"] }
+polymarket_client_sdk_v2 = { version = "=0.6.0-canary.1", features = ["clob", "ws", "rtds", "gamma", "ctf"] }
 
 # Chainlink price feeds
 chainlink-data-streams-sdk = { version = "1.2", features = ["full"] }
