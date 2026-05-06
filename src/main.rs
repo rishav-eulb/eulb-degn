@@ -245,7 +245,7 @@ async fn run_bot(cfg: config::Config) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    error!(error = %e, asset = asset_key.as_str(), "Leg2 order error (not retrying — likely a build/signing failure)");
+                                    error!(error = ?e, asset = asset_key.as_str(), "Leg2 order error (not retrying)");
                                 }
                                 _ => {}
                             }

@@ -152,23 +152,27 @@ impl OrderExecutor {
     }
 
     async fn execute_leg2(&self, token_id: &str, price: f64, shares: f64) -> Result<OrderResult> {
-        // Polymarket CLOB requires prices on a 0.01 tick grid; floor to stay within budget.
+        // Polymarket CLOB requires prices and sizes on a 0.01 grid.
         let price_ticked = (price * 100.0).floor() / 100.0;
+        let shares_ticked = (shares * 100.0).floor() / 100.0;
         if price_ticked <= 0.0 || price_ticked >= 1.0 {
             anyhow::bail!(
                 "Leg2 price {price} rounds to {price_ticked} which is outside (0, 1)"
             );
         }
+        if shares_ticked <= 0.0 {
+            anyhow::bail!("Leg2 shares {shares} rounds to {shares_ticked} which is <= 0");
+        }
 
-        info!(token_id, price = price_ticked, shares, "Placing Leg2 limit order (maker)");
+        info!(token_id, price = price_ticked, shares = shares_ticked, "Placing Leg2 limit order (maker)");
 
         if self.inner.dry_run {
             debug!("DRY RUN — simulating Leg2 fill");
-            return Ok(OrderResult::Filled { fill_price: price_ticked, shares });
+            return Ok(OrderResult::Filled { fill_price: price_ticked, shares: shares_ticked });
         }
 
         let price_dec = rust_decimal::Decimal::from_f64(price_ticked).context("Invalid Leg2 price")?;
-        let size_dec = rust_decimal::Decimal::from_f64(shares).context("Invalid Leg2 shares")?;
+        let size_dec = rust_decimal::Decimal::from_f64(shares_ticked).context("Invalid Leg2 shares")?;
         self.execute_limit_order(token_id, Side::Buy, price_dec, size_dec).await
     }
 
@@ -320,6 +324,7 @@ impl OrderExecutor {
         let client = self.get_client().await?;
         let token = U256::from_str(token_id).context("Invalid token_id (not a valid U256)")?;
 
+        debug!(%token, %size, %price, ?side, "Building limit order via SDK");
         let order = client
             .limit_order()
             .token_id(token)
@@ -328,6 +333,10 @@ impl OrderExecutor {
             .side(side)
             .build()
             .await
+            .map_err(|e| {
+                error!(%price, %size, ?side, error = ?e, "SDK limit_order().build() failed");
+                e
+            })
             .context("Failed to build limit order")?;
 
         let signed_order = client
